@@ -5,9 +5,9 @@
 # tiles of an older version with a new one.
 set -euo pipefail
 builtin cd "$(dirname "$0")"
-SCALE="${SCALE:-4}"
+SCALE="${SCALE:-2}"
 SITE=site
-VIEWS=$(builtin cd scripts && python3 -c "from config import VIEWS; print(*VIEWS)")
+VIEWS=$(uv run --no-sync python -c 'import sys;sys.path.insert(0,"scripts");from config import VIEWS;print(*VIEWS)')
 
 stamp=$(date +%Y%m%d-%H%M%S)
 rm -rf "$SITE" && mkdir -p "$SITE/tiles-$stamp"
@@ -23,7 +23,7 @@ for look in $VIEWS; do
   dir=$([ -z "$suffix" ] && echo "" || echo "v$look/")
   full="out/full-$SCALE$suffix.png"
   [ -f "$full" ] || { echo "skipping view $look: no $full" >&2; continue; }
-  pyramid "$full" "${dir}helenaveen"
+  pyramid "$full" "${dir}saiwai"
   # The buildings and trees once more, transparent elsewhere: the viewer lays them over the cars and walkers behind them.
   objects="out/objects-$SCALE$suffix.png"
   if [ -f "$objects" ]; then
@@ -40,18 +40,21 @@ m = json.load(open(f"out/tiles-{scale}/layout.json"))
 m["views"] = []
 for look in views:
     base = f"tiles-{stamp}/" + ("" if look == "45" else f"v{look}/")
-    if not os.path.isdir(f"{site}/{base}helenaveen_files"):
+    if not os.path.isdir(f"{site}/{base}saiwai_files"):
         continue
-    view = {"look": int(look), "tiles": f"{base}helenaveen_files/"}
+    view = {"look": int(look), "tiles": f"{base}saiwai_files/"}
     if os.path.isdir(f"{site}/{base}objects_files"):
         view["objects"] = f"{base}objects_files/"
     m["views"].append(view)
 m.update({k: m["views"][0][k] for k in ("tiles", "objects") if k in m["views"][0]})
 json.dump(m, open(f"{site}/map.json", "w"))
 PY
-cp viewer/index.html viewer/en.json viewer/og.png data/build/places.json data/build/hotspots.json data/build/routes.json data/build/history.json data/build/traffic.json "$SITE/"
-cp -r data/build/history "$SITE/history"
-[ -d data/build/photos ] && cp -r data/build/photos "$SITE/photos"
+cp viewer/index.html viewer/geo.js viewer/projection.js viewer/en.json data/build/places.json data/build/hotspots.json data/build/routes.json data/build/history.json data/build/traffic.json data/build/terrain-viewer.json data/build/source-manifest.json data/build/geodata.zip DATA_SOURCES.md "$SITE/"
+cp data/build/lidar-coverage.png "$SITE/"
 cp -r viewer/music "$SITE/music"
+# Actual mapped street-lamp locations (decorative light, no guessed village centre).
+uv run --no-sync python scripts/site_metadata.py
+mkdir -p "$SITE/vendor"
+cp viewer/vendor/openseadragon.min.js viewer/vendor/OpenSeadragon-LICENSE.txt "$SITE/vendor/"
 touch "$SITE/.nojekyll"
 echo "$SITE/ is ready: $(find "$SITE" -type f | wc -l) files, $(du -sh "$SITE" | cut -f1)"

@@ -1,30 +1,47 @@
-# Isometric Helenaveen
+# 幸区の小さな地図
 
-Hi, I'm [@jankeesvw](https://x.com/intent/follow?screen_name=jankeesvw) on X. I rebuilt my village Helenaveen in isometric pixel art, with Claude Code and nothing but open data. See it live at [jankeesvw.github.io/isometric-helenaveen](https://jankeesvw.github.io/isometric-helenaveen/).
+川崎市幸区・神奈川県・日本を、公開された実際の地理データから描く立体ピクセル地図。原作は[jankeesvw / Isometric Helenaveen](https://github.com/jankeesvw/isometric-helenaveen)（8cb8b47）です。three.jsによる等角投影、Deep Zoom、検索、地域カード、回転、音楽、夜景を引き継ぎ、日本のデータに置き換えています。
 
-A zoomable isometric pixel-art map of Helenaveen, 3.5 × 5.5 km from the A67 north along the Soemeersingel to the Willem III-hoeve, in the spirit of [isometric.nyc](https://cannoneyed.com/projects/isometric-nyc). Where that project painted every tile with a fine-tuned image model, this one is rendered procedurally from Dutch open data, so it is exact, seamless and rebuilds in about two minutes.
+## ビルド
 
-## Pipeline
+Python 3.11以上、uv、Node.js/npm、libvips、Playwright Chromiumが必要です。Python依存はpyproject.tomlとuv.lockでプロジェクト内に固定し、グローバルpipは使いません。
 
-Run `./build.sh` for everything. The steps:
+```bash
+uv sync --locked
+npm ci --ignore-scripts
+npx playwright install chromium
+# 自動取得する限定範囲のOSM、GSI、メタデータ。2回目以降はキャッシュを再利用。
+uv run python scripts/fetch.py
+SCALE=2 ./build.sh
+python3 -m http.server 8000 --directory site
+```
 
-1. `scripts/fetch.py` downloads the raw data into `data/raw/`: 3D BAG buildings (LoD2.2 with roof shapes), BGT surfaces (roads, water, plots, vegetation), the PDOK aerial photo at 25 cm and AHN surface and terrain heights at 50 cm.
-2. `scripts/landmarks.py` names the places people look for: both churches, the parsonage and Sunday school of 1867, school De Peelparel, monuments, the sports park. It gives them their real colors (from Rijksmonumenten photos) and adds what 3D BAG smooths away, like the 26 m tower of the Sint-Willibrorduskerk and the roof turret of the Protestant church, both measured in AHN. `scripts/build_buildings.py` triangulates the 3D BAG solids and lays the aerial photo on every roof (`scripts/roof_atlas.py`): the photo is lined up with each footprint by matching edges (it is off by 1.2 m on average), each roof face is evened out so the photo's sun and shade don't double up with the renderer's lighting, and the result is reduced to a few flat colors so solar panels, skylights and chimneys show as clean shapes. 3D BAG cannot reconstruct greenhouses (lidar goes through glass), so those are extruded from their footprint with a gutter height based on the year of construction. Water tanks, feed silos and sheds come from the BGT.
-3. `scripts/build_trees.py` finds individual trees in the canopy height model (AHN surface minus terrain): local maxima for the tops, watershed segmentation for crown size, and the spring aerial photo to tell evergreens from deciduous trees. Municipal street trees from the BGT fill in what the lidar missed.
-4. `scripts/build_ground.py` paints the BGT polygons, plus football and tennis lines, the riding arenas and both graveyards from OpenStreetMap, in a fixed palette with patterns (furrows along each field's long axis, paving grids, ripples, a dark far bank on every ditch) and bakes hard sun shadows of the buildings and tree crowns into it.
-5. `render/scene.js` is a three.js scene with a 2:1 isometric orthographic camera. Window grids, brick plinths, metal cladding and greenhouse glass are drawn in the building shader, a post pass smooths the image with a Kuwahara filter (a painterly look without grain) and inks every depth step as an outline. Tree crowns are cel-shaded with three tones. `render/run.mjs` renders it in headless Chromium on the GPU (Vulkan), tile by tile with a view offset, so tiles line up exactly.
-6. `vips dzsave` cuts the stitched image into a Deep Zoom pyramid of WebP tiles, and `viewer/index.html` shows it with OpenSeadragon: tilt-shift blur, GPS coordinates under the cursor, a search box over every place and address (`scripts/build_places.py`), named buildings and places that light up on hover and open a card with their story, photo and links when clicked, grouped into series (Koningshoeven, Historische gebouwen, Oorlog en herdenking, Kunst, Verdwenen, Bedrijven) to step through like the tour (`scripts/landmarks.py`, `scripts/build_hotspots.py`; a link ending in `#koningshoeven` opens a series), a guided tour "Helenaveen van toen" along twenty historical places with photos from the Rijksdienst voor het Cultureel Erfgoed, each linking to its story on [Het Helenaveen van toen](https://www.helenaveenvantoen.nl/) (`scripts/build_history.py`; a link ending in `#van-toen` starts it), and a toggle for the walking routes and numbered junctions of the wandelknooppuntennetwerk and LAW 13 from OpenStreetMap (`scripts/build_routes.py`). Little cars, vans, trucks and cyclists drive the OpenStreetMap roads and cycle paths on the right-hand side, keeping their distance and passing behind buildings and under tree crowns: the renderer also writes a mask of everything that stands more than 30 cm above the ground (`--pass objects`), `site.sh` turns the map under that mask into a second, transparent tile layer, and the viewer draws whatever is behind something between the two layers, and now and then geese cross high up in a V (`scripts/build_traffic.py`). A link ending in `#Sint-Willibrorduskerk` or `#De-Peelparel` opens on that place. A compass button turns the map a quarter: the map is rendered from all four diagonal directions (`VIEWS` in `scripts/config.py`, `render/run.mjs --look`), and the viewer turns a still of the old view about the middle of the screen like a turntable while the new view turns in after it, keeping the spot in the middle in place; halfway through the turn the pixels grow coarse and fine again, like an old game console. The map opens on the village school, and the home button goes back there. A music button plays [My Street](https://opengameart.org/content/my-street) by congusbongus (CC0, from OpenGameArt) on a loop; it is off until a visitor turns it on, and the browser remembers that for next time. A moon button turns the map to evening (`viewer/og.png`, the picture for link previews, shows that evening): an SVG colour matrix (`#dusk`) puts the map, its traffic and the minimap in moonlight, and a canvas above it lights a lamp every 34 m along the village streets and the headlights and rear lights of every car and bike; it is remembered the same way. A click on the map, not on a place, drops a pin and writes it into the address with the zoom and direction (`?pin=51.38884,5.91741&zoom=1.23&view=135`), so that link opens on the same spot. Six people take a cold dip in a circle in the Helenavaart in front of In d'Ouwe Peel. The viewer speaks Dutch and English, after the browser's language (`?lang=en` or `?lang=nl` asks for one); static text carries its English in `data-en*` attributes, and the stories, kinds and photo credits from the data files are looked up by their Dutch in `viewer/en.json`. A button in the corner opens the prompt to make a map like this of another village, in either language, which tells the agent which Dutch data sources to swap for the open data of another country.
+大容量の原典は一度だけ取得してdata/rawへ配置します。詳しいURL・版・ライセンスは[DATA_SOURCES.md](DATA_SOURCES.md)。
 
-`./site.sh` cuts the rendered image into tiles and assembles `site/` without rendering anything; each run writes its tiles to a fresh `tiles-<stamp>/` folder so browsers never mix cached tiles of two versions. `./deploy.sh` publishes `site/` to the `gh-pages` branch as a single fresh commit, so the tiles never pile up in the history of `main`.
+- `data/raw/plateau/kawasaki-2022-v4.zip`：PLATEAU CityGML v4。
+- `data/raw/lidar/09LD*.zip`：記載した13点群ZIPと、取得URL・SHA256・日時の`.source.json`。
+- `data/raw/gsi/`、`osm_map.json`、`osm_boundary.json`：fetch.pyが限定範囲・最大3並列・2回までの試行で取得。欠損を黙って架空データへ置換しません。
 
-The camera looks north-east and the sun comes from the west-south-west (`scripts/sun.py`, mirrored in `render/scene.js`).
+`./build.sh`は取得確認、再投影、地形・点群、建物、樹木、地表、地域カード、交通、出典マニフェスト、4方向の画像と物体マスク、Deep Zoomを生成します。`SCALE`は画素/mで既定2、4は縦横2倍・画素数4倍。レンダーはdisplayless Chromium。デスクトップのGUI確認にはOmaboxを使います。`./site.sh`は既存レンダーからsiteを再構成します（SCALEを合わせる）。データと成果物はgit対象外です。
 
-Overlays (search, hover outlines, walking routes, the tour, traffic) are JSON files next to the tiles: changing them needs no rendering, only the small build script and `./deploy.sh`.
+出力は`site/map.json`、WebP Deep Zoomタイル、JSONオーバーレイ、source-manifest.json、ダウンロード用geodata.zip。Pagesのリポジトリ配下に置ける相対パスです。OpenSeadragon 4.1.1とBSDライセンス表示を同梱し、フォントは端末の代替フォントを使うため、地図の中核表示は外部CDNに依存しません。
 
-## Iterating
+## 精度と範囲
 
-`node render/run.mjs crop <x> <y> <w> <h> --scale 4 --out out/crop.png` renders one region of the full image in a second, which is the fastest way to try a shader or palette change. `node render/run.mjs crop 0 0 2546 1303 --scale 0.6` gives an overview of the whole map.
+EPSG:32654 / UTM54N。幸区のOSM行政界全体を収めた5.5 × 4.5 kmの周辺付き矩形です。全建物はPLATEAUの実ポリゴンと標高で、最高利用可能LoDを一つだけ使用。地形はGSI DTM、加瀬山も起伏を持ちます。神奈川県2022点群で実測DSMと植生を取得できた範囲は約30%。それ以外の木の高さ8 mは推定です。
 
-## Data
+屋根の大半はLoD1の平屋根。壁・窓・樹冠の形・交通は様式化、橋の高さは未再現。屋根アトラスの精密な写真整合は未実装です。撮影年と取得日は異なります。詳細な制約・出典は常に画面から読めます。地域の体験談はユーザー提供待ちです。
 
-3D BAG (TU Delft, 3DGI, CC BY 4.0), BGT (CC0), AHN (CC0), BAG addresses and the aerial photo (Beeldmateriaal Nederland, CC BY 4.0), all via [PDOK](https://www.pdok.nl). Points of interest, pitches and graveyards from OpenStreetMap (ODbL). Building descriptions from Monumenten in Nederland: Noord-Brabant (1997).
+```bash
+uv run python -m unittest discover -s tests -v
+node tests/geo.mjs
+uv run python -m compileall -q scripts
+bash -n build.sh site.sh deploy.sh
+node --check render/scene.js
+node --check render/run.mjs
+git diff --check
+```
+
+## 公開
+
+deploy.shは明示したPUBLISH_REPOだけを対象とし、上流作者への書き込みと既存gh-pages履歴の置換を拒否します。原作のREADMEは他地域への改変と公開を案内しています。上流チェックアウト内に正式なLICENSEファイルはなく、本リポジトリで独自のライセンスを追加していません。原作者・使用ライブラリ・データのクレジットを維持しています。

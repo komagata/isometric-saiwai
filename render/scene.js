@@ -1,4 +1,4 @@
-// Isometric scene of Helenaveen, rendered tile by tile by render/run.mjs.
+// Isometric scene of Saiwai Ward, rendered tile by tile by render/run.mjs.
 // World units are meters: x east, y up, z south, origin at the center of the 3 x 3 km area.
 import * as THREE from 'three';
 import { mergeVertices } from 'three/addons/utils/BufferGeometryUtils.js';
@@ -9,7 +9,7 @@ const SUN_AZIMUTH = 250; // keep in sync with scripts/sun.py
 const SUN_ELEVATION = 40;
 const SLAB = 14; // depth of the diorama block under the ground
 const CAMERA_ELEVATION = 30; // 2:1 pixel-art isometric
-const TOP_MARGIN = 32;
+const TOP_MARGIN = 220;
 const BACKGROUND = new THREE.Color(0x20242c);
 const ROAD_ALPHA = 0.5; // marks road pixels in the color target, see makeRoads and the post pass
 
@@ -328,22 +328,22 @@ async function makeTrees() {
   const m = new THREE.Matrix4(), q = new THREE.Quaternion(), s = new THREE.Vector3(), p = new THREE.Vector3();
   const up = new THREE.Vector3(0, 1, 0);
   for (let i = 0; i < n; i++) {
-    const [x, z, h, r, base, kind, , , , seed] = t.subarray(i * 10, i * 10 + 10);
+    const [x, z, h, r, base, kind, ground, , , seed] = t.subarray(i * 10, i * 10 + 10);
     q.setFromAxisAngle(up, seed * Math.PI * 2);
     const trunkW = Math.min(0.7, 0.3 + h * 0.02);
     const trunkH = Math.max(1, Math.min(base, h - 2 * Math.max(1, (h - base) / 2, Math.min(r * 0.9, h * 0.42))) + 0.8);
-    m.compose(p.set(x, trunkH / 2, z), q, s.set(trunkW, trunkH, trunkW));
+    m.compose(p.set(x, ground + trunkH / 2, z), q, s.set(trunkW, trunkH, trunkW));
     trunks.setMatrixAt(i, m);
     if (kind > 0.5) {
       const bottom = base * 0.5;
-      m.compose(p.set(x, (bottom + h) / 2, z), q, s.set(r * 0.9, h - bottom, r * 0.9));
+      m.compose(p.set(x, ground + (bottom + h) / 2, z), q, s.set(r * 0.9, h - bottom, r * 0.9));
       cones.setMatrixAt(ci, m);
       cones.setColorAt(ci++, NEEDLES[Math.floor(seed * 97) % NEEDLES.length]);
     } else {
       const k = Math.floor(seed * 3) % 3;
       // Full, round crowns: seen from above, a tree is mostly crown.
       const half = Math.max(1, (h - base) / 2, Math.min(r * 0.9, h * 0.42));
-      m.compose(p.set(x, h - half, z), q, s.set(r * 1.12, half, r * 1.12));
+      m.compose(p.set(x, ground + h - half, z), q, s.set(r * 1.12, half, r * 1.12));
       crowns[k].setMatrixAt(fill[k], m);
       const c = LEAVES[Math.floor(seed * 1013) % LEAVES.length].clone();
       c.multiplyScalar(0.92 + 0.16 * hash(seed * 77));
@@ -360,7 +360,7 @@ async function makeTrees() {
 // ---------------------------------------------------------------------------------------------
 // Ground and diorama block
 
-async function makeGround(renderer, area) {
+async function makeGround(renderer, area, terrain) {
   const group = new THREE.Group();
   const loader = new THREE.TextureLoader();
   const size = area.chunk;
@@ -374,7 +374,11 @@ async function makeGround(renderer, area) {
           tex.minFilter = THREE.LinearMipmapLinearFilter;
           tex.magFilter = THREE.LinearFilter;
           tex.wrapS = tex.wrapT = THREE.ClampToEdgeWrapping;
-          const plane = new THREE.Mesh(new THREE.PlaneGeometry(size, size), new THREE.MeshBasicMaterial({ map: tex }));
+          const geometry = new THREE.PlaneGeometry(size, size, size / area.terrain_step, size / area.terrain_step);
+          const heights = terrain[`${ix}_${iy}`];
+          for (let i = 0; i < heights.length; i++) geometry.attributes.position.setZ(i, heights[i]);
+          geometry.computeVertexNormals();
+          const plane = new THREE.Mesh(geometry, new THREE.MeshBasicMaterial({ map: tex }));
           plane.rotation.x = -Math.PI / 2;
           plane.position.set(-area.hx + size / 2 + ix * size, 0, area.hz - size / 2 - iy * size);
           group.add(plane);
@@ -463,28 +467,38 @@ async function makeRoads(renderer, area) {
   return group;
 }
 
-function makeSlab(area) {
-  // Peat over sand: the soil Helenaveen was dug out of.
-  const c = document.createElement('canvas');
-  c.width = 4;
-  c.height = 280;
-  const ctx = c.getContext('2d');
-  const layers = [
-    [0, 6, '#4b3a26'], [6, 10, '#2e2218'], [10, 60, '#3a2a1c'], [60, 64, '#2a1f16'], [64, 110, '#45321f'],
-    [110, 116, '#2c2117'], [116, 150, '#56402a'], [150, 158, '#7a6a4a'], [158, 280, '#b39c6c'],
-  ];
-  for (const [a, b, col] of layers) {
-    ctx.fillStyle = col;
-    ctx.fillRect(0, a, 4, b - a);
+function makeSlab(area, terrain) {
+  if (!Number.isFinite(area.slab_top) || !(area.slab_top < area.min_terrain)) {
+    throw new Error('Diorama slab must be below measured terrain minimum. Rebuild area metadata.');
   }
-  const tex = new THREE.CanvasTexture(c);
-  tex.magFilter = THREE.NearestFilter;
-  tex.minFilter = THREE.NearestFilter;
-  const side = new THREE.MeshLambertMaterial({ map: tex });
-  const top = new THREE.MeshBasicMaterial({ color: 0x3a2a1c });
-  const box = new THREE.Mesh(new THREE.BoxGeometry(area.hx * 2, SLAB, area.hz * 2), [side, side, top, top, side, side]);
-  box.position.y = -SLAB / 2 - 0.02;
-  return box;
+  // Neutral schematic section; colour does not imply a geological soil profile.
+  const side = new THREE.MeshLambertMaterial({color:0x827c6a, side:THREE.DoubleSide});
+  const base = new THREE.Mesh(new THREE.BoxGeometry(area.hx*2,SLAB,area.hz*2),side);
+  base.position.y=area.slab_top-SLAB/2;
+  const group=new THREE.Group();group.add(base);
+  // Drape the four outer boundaries from actual sampled ground to the base. The
+  // horizontal base never projects through negative-MSL river/terrain cells.
+  const triangles=[],n=area.chunk/area.terrain_step+1;
+  const strip=(points)=>{
+    for(let i=1;i<points.length;i++){
+      const a=points[i-1],b=points[i],lowA=[a[0],area.slab_top,a[2]],lowB=[b[0],area.slab_top,b[2]];
+      triangles.push(...a,...b,...lowA,...b,...lowB,...lowA);
+    }
+  };
+  for(let ix=0;ix<area.nx;ix++){
+    const south=terrain[`${ix}_0`],north=terrain[`${ix}_${area.ny-1}`];
+    strip(Array.from({length:n},(_,i)=>[-area.hx+ix*area.chunk+i*area.terrain_step,south[(n-1)*n+i],area.hz]));
+    strip(Array.from({length:n},(_,i)=>[-area.hx+ix*area.chunk+i*area.terrain_step,north[i],-area.hz]));
+  }
+  for(let iy=0;iy<area.ny;iy++){
+    const west=terrain[`0_${iy}`],east=terrain[`${area.nx-1}_${iy}`];
+    strip(Array.from({length:n},(_,i)=>[-area.hx,west[i*n],area.hz-(iy+1)*area.chunk+i*area.terrain_step]));
+    strip(Array.from({length:n},(_,i)=>[area.hx,east[i*n+n-1],area.hz-(iy+1)*area.chunk+i*area.terrain_step]));
+  }
+  const geometry=new THREE.BufferGeometry();
+  geometry.setAttribute('position',new THREE.Float32BufferAttribute(triangles,3));
+  geometry.computeVertexNormals();group.add(new THREE.Mesh(geometry,side));
+  return group;
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -501,7 +515,7 @@ function makeCamera(scale, area, look) {
   const vGround = (area.hx * Math.abs(Math.sin(az)) + area.hz * Math.abs(Math.cos(az))) * Math.sin(el);
   const width = Math.round(2 * u * scale);
   const top = vGround + TOP_MARGIN;
-  const bottom = -vGround - SLAB * Math.cos(el) - 6;
+  const bottom = -vGround + (area.slab_top - SLAB) * Math.cos(el) - 6;
   const height = Math.round((top - bottom) * scale);
   const cam = new THREE.OrthographicCamera(-width / scale / 2, width / scale / 2, top, top - height / scale, 10, 9000);
   const fwd = new THREE.Vector3(Math.cos(el) * Math.sin(az), -Math.sin(el), -Math.cos(el) * Math.cos(az));
@@ -561,12 +575,8 @@ const outlineShader = {
 
     void main() {
       if (objectsPass) {
-        // A mask of what stands up from the ground: white where the visible surface is more than 30 cm up (buildings,
-        // trees, masts), black for the ground, roads and bridges. The viewer draws this part of the map again over
-        // the cars and walkers that are behind it.
-        float z = texture2D(tDepth, vUv).x;
-        vec4 p = invViewProj * vec4(vUv * 2.0 - 1.0, z * 2.0 - 1.0, 1.0);
-        gl_FragColor = vec4(vec3(z < 1.0 && p.y / p.w > 0.3 ? 1.0 : 0.0), 1.0);
+        // Object identity, not absolute height above the Tokyo Bay datum.
+        gl_FragColor = vec4(vec3(texture2D(tColor, vUv).r > 0.5 ? 1.0 : 0.0), 1.0);
         return;
       }
       vec4 c = texture2D(tColor, vUv);
@@ -602,8 +612,20 @@ async function main() {
   const area = await (await fetch(`${DATA}/area.json`)).json();
   area.hx = (area.xmax - area.xmin) / 2;
   area.hz = (area.ymax - area.ymin) / 2;
-  const [ground, roads, buildings, trees] = await Promise.all([makeGround(renderer, area), makeRoads(renderer, area), makeBuildings(), makeTrees()]);
-  scene.add(ground, roads, buildings, trees, makeSlab(area));
+  const terrain = await (await fetch(`${DATA}/terrain.json`)).json();
+  const [ground, roads, buildings, trees] = await Promise.all([makeGround(renderer, area, terrain), makeRoads(renderer, area), makeBuildings(), makeTrees()]);
+  const slab = makeSlab(area, terrain);
+  scene.add(ground, roads, buildings, trees, slab);
+  if (objectsPass) {
+    // Semantic mask: terrain at positive MSL elevation is still ground.
+    scene.background = new THREE.Color(0x000000);
+    for (const [group, color] of [[ground,0],[roads,0],[slab,0],[buildings,0xffffff],[trees,0xffffff]]) {
+      group.traverse(obj => { if (obj.isMesh) {
+        if (obj.isInstancedMesh) obj.instanceColor = null;
+        obj.material = new THREE.MeshBasicMaterial({color, side:THREE.DoubleSide});
+      } });
+    }
+  }
 
   const { cam, width, height } = makeCamera(scale, area, look);
   let target = null;

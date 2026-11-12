@@ -1,0 +1,6 @@
+[project]
+name = "isometric-saiwai"
+version = "0.1.0"
+description = "幸区の小さな地図 — reproducible open-data diorama"
+requires-python = ">=3.11"
+dependencies = ["numpy>=2", "pillow>=11", "scipy>=1.14", "shapely>=2", "pyproj>=3.7", "mapbox-earcut>=1"]

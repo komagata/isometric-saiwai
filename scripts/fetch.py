@@ -1,227 +1,123 @@
-# /// script
-# requires-python = ">=3.11"
-# dependencies = []
-# ///
-"""Download the raw open data for the area: 3D BAG, BGT, aerial photos and AHN."""
+"""Bounded, cached source acquisition. Also callable independently by a network-enabled coordinator.
 
+python3 scripts/fetch.py --group osm|gsi|metadata|all
+No credentials. Three concurrent GSI requests; two attempts per URL; atomic cache writes.
+"""
+import argparse
+import hashlib
 import json
-import sys
+import math
 import time
+import urllib.error
 import urllib.parse
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
 
-from config import CHUNK, NX, NY, RAW, XMAX, XMIN, YMAX, YMIN
-
-UA = {"User-Agent": "isometric-helenaveen/0.1"}
-RD = "http://www.opengis.net/def/crs/EPSG/0/28992"
-
-BGT_COLLECTIONS = [
-    "begroeidterreindeel",
-    "onbegroeidterreindeel",
-    "wegdeel",
-    "ondersteunendwegdeel",
-    "waterdeel",
-    "ondersteunendwaterdeel",
-    "overbruggingsdeel",
-    "overigbouwwerk",
-    "kunstwerkdeel_vlak",
-    "scheiding_vlak",
-    "scheiding_lijn",
-    "vegetatieobject_punt",
-    "vegetatieobject_vlak",
-    "vegetatieobject_lijn",
-    "pand",
-    "spoor",
-    "weginrichtingselement_lijn",
-    "weginrichtingselement_vlak",
-    "straatmeubilair",
-    "paal",
-    "mast",
-]
+RAW = Path(__file__).resolve().parent.parent / 'data/raw'
+# Retrieval envelope; rendered area is checked against the exact OSM ward boundary.
+BOUNDS = (35.520, 139.640, 35.580, 139.715)
+UA = {'User-Agent': 'isometric-saiwai/0.1 (cached bounded open-data map)'}
+PLATEAU_URL = 'https://assets.cms.plateau.reearth.io/assets/40/25bd0a-f174-4f55-a9bd-0e6868ece0ae/14130_kawasaki-shi_city_2022_citygml_4_op.zip'
 
 
-def get(url, binary=False, tries=5):
-    for attempt in range(tries):
+def download(url, dst, body=None, optional=False):
+    dst = Path(dst)
+    if dst.exists():
+        return True
+    if optional and dst.with_suffix(dst.suffix + '.missing').exists():
+        return False
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    for attempt in range(2):
         try:
-            with urllib.request.urlopen(urllib.request.Request(url, headers=UA), timeout=120) as r:
-                data = r.read()
-                return data if binary else json.loads(data)
-        except Exception as e:  # noqa: BLE001
-            if attempt == tries - 1:
-                raise
-            print(f"retry {attempt + 1} {url[:100]}: {e}", file=sys.stderr)
-            time.sleep(2 * (attempt + 1))
+            req = urllib.request.Request(url, data=body, headers=UA)
+            with urllib.request.urlopen(req, timeout=180) as response:
+                payload = response.read()
+                info = {'url': url, 'retrieved_at': datetime.now(timezone.utc).isoformat(),
+                        'sha256': hashlib.sha256(payload).hexdigest(), 'bytes': len(payload),
+                        'last_modified': response.headers.get('Last-Modified')}
+                if body:
+                    info['query'] = urllib.parse.parse_qs(body.decode()).get('data', [])
+            tmp = dst.with_suffix(dst.suffix + '.tmp')
+            tmp.write_bytes(payload)
+            tmp.replace(dst)
+            dst.with_suffix(dst.suffix + '.source.json').write_text(json.dumps(info, ensure_ascii=False, indent=2))
+            return True
+        except urllib.error.HTTPError as exc:
+            if optional and exc.code == 404:
+                dst.with_suffix(dst.suffix + '.missing').write_text(url + '\n')
+                return False
+            error = exc
+        except (OSError, ValueError) as exc:
+            error = exc
+        if attempt == 0:
+            time.sleep(3)
+    raise RuntimeError(f'Cannot fetch {url} into {dst}: {error}. Cache is preserved; retry with permitted network.')
 
 
-def fetch_3dbag():
-    out = RAW / "3dbag.jsonl"
-    if out.exists():
-        return
-    url = f"https://api.3dbag.nl/collections/pand/items?bbox={XMIN},{YMIN},{XMAX},{YMAX}&limit=100"
-    n = 0
-    with open(out.with_suffix(".tmp"), "w") as f:
-        while url:
-            page = get(url)
-            transform = page["metadata"]["transform"]
-            for feat in page["features"]:
-                feat["transform"] = transform
-                f.write(json.dumps(feat) + "\n")
-                n += 1
-            url = next((l["href"] for l in page["links"] if l["rel"] == "next"), None)
-            print(f"3dbag {n}/{page['numberMatched']}", file=sys.stderr)
-    out.with_suffix(".tmp").rename(out)
-
-
-def fetch_bgt(coll):
-    out = RAW / f"bgt_{coll}.geojson"
-    if out.exists():
-        return
-    q = urllib.parse.urlencode(
-        {"bbox": f"{XMIN},{YMIN},{XMAX},{YMAX}", "bbox-crs": RD, "crs": RD, "limit": 1000, "f": "json"}
-    )
-    url = f"https://api.pdok.nl/lv/bgt/ogc/v1/collections/{coll}/items?{q}"
-    feats = []
-    while url:
-        page = get(url)
-        feats += page["features"]
-        url = next((l["href"] for l in page["links"] if l["rel"] == "next"), None)
-    # The API also serves retired versions of objects; keep only the current ones.
-    current = [f for f in feats if not f["properties"].get("eind_registratie")]
-    out.write_text(json.dumps({"type": "FeatureCollection", "features": current}))
-    print(f"bgt {coll}: {len(current)} current of {len(feats)}", file=sys.stderr)
-
-
-def fetch_aerial(ix, iy, chunk=CHUNK, res=0.25):
-    d = RAW / "aerial"
-    d.mkdir(exist_ok=True)
-    out = d / f"{ix}_{iy}.jpg"
-    if out.exists():
-        return
-    x0, y0 = XMIN + ix * chunk, YMIN + iy * chunk
-    px = int(chunk / res)
-    q = urllib.parse.urlencode(
-        {
-            "SERVICE": "WMS",
-            "VERSION": "1.3.0",
-            "REQUEST": "GetMap",
-            "LAYERS": "Actueel_orthoHR",
-            "STYLES": "",
-            "CRS": "EPSG:28992",
-            "BBOX": f"{x0},{y0},{x0 + chunk},{y0 + chunk}",
-            "WIDTH": px,
-            "HEIGHT": px,
-            "FORMAT": "image/jpeg",
-        }
-    )
-    out.write_bytes(get(f"https://service.pdok.nl/hwh/luchtfotorgb/wms/v1_0?{q}", binary=True))
-
-
-def fetch_ahn(cov, ix, iy, chunk=CHUNK):
-    # The WCS refuses anything over 4000 px a side, so fetch it in chunks (1000 px at 0.5 m).
-    d = RAW / "ahn"
-    d.mkdir(exist_ok=True)
-    out = d / f"{cov}_{ix}_{iy}.tif"
-    if out.exists():
-        return
-    x0, y0 = XMIN + ix * chunk, YMIN + iy * chunk
-    url = (
-        "https://service.pdok.nl/rws/ahn/wcs/v1_0?SERVICE=WCS&VERSION=2.0.1&REQUEST=GetCoverage"
-        f"&COVERAGEID={cov}&SUBSET=x({x0},{x0 + chunk})&SUBSET=y({y0},{y0 + chunk})&FORMAT=image/tiff"
-    )
-    out.write_bytes(get(url, binary=True))
-
-
-def fetch_addresses():
-    """Every BAG address in Helenaveen, for the viewer's search box."""
-    out = RAW / "addresses.json"
-    if out.exists():
-        return
-    pts, start = [], 0
-    while True:
-        q = urllib.parse.urlencode(
-            {"q": "*", "fq": ["woonplaatsnaam:Helenaveen", "type:adres"], "fl": "weergavenaam,centroide_rd", "rows": 100, "start": start},
-            doseq=True,
-        )
-        d = get(f"https://api.pdok.nl/bzk/locatieserver/search/v3_1/free?{q}")["response"]
-        for doc in d["docs"]:
-            x, y = (float(v) for v in doc["centroide_rd"][6:-1].split())
-            pts.append((x, y, doc["weergavenaam"]))
-        start += 100
-        if start >= d["numFound"]:
-            break
-    out.write_text(json.dumps(pts))
-
-
-def overpass(out, q, what):
-    """Run an Overpass query into out (Overpass is often busy, so try a few servers)."""
-    for host in ("overpass-api.de/api/interpreter", "overpass.private.coffee/api/interpreter", "maps.mail.ru/osm/tools/overpass/api/interpreter"):
-        try:
-            req = urllib.request.Request(f"https://{host}", data=urllib.parse.urlencode({"data": q}).encode(), headers=UA)
-            with urllib.request.urlopen(req, timeout=180) as r:
-                out.write_bytes(r.read())
-            return
-        except Exception as e:  # noqa: BLE001
-            print(f"overpass {host}: {e}", file=sys.stderr)
-    print(f"OpenStreetMap unavailable; {what} are skipped", file=sys.stderr)
-
-
-def osm_bbox():
-    from geo import rd_to_wgs
-
-    lats, lons = zip(*(rd_to_wgs(x, y) for x in (XMIN, XMAX) for y in (YMIN, YMAX)))
-    return f"{min(lats)},{min(lons)},{max(lats)},{max(lons)}"
+def tiles(z):
+    s, w, n, e = BOUNDS
+    def at(lat, lon):
+        return (int((lon + 180) / 360 * 2**z), int((1 - math.asinh(math.tan(math.radians(lat))) / math.pi) / 2 * 2**z))
+    x0, y1 = at(s, w)
+    x1, y0 = at(n, e)
+    return [(x, y) for x in range(x0, x1 + 1) for y in range(y0, y1 + 1)]
 
 
 def fetch_osm():
-    """Pitches, graveyards and points of interest from OpenStreetMap."""
-    out = RAW / "osm_landmarks.json"
-    if out.exists():
-        return
-    bbox = osm_bbox()
-    q = f"""[out:json][timeout:90];
-( nwr["military"]({bbox}); way["leisure"="pitch"]({bbox}); nwr["landuse"="cemetery"]({bbox});
-  nwr["amenity"="place_of_worship"]({bbox}); nwr["tourism"]({bbox}); nwr["historic"]({bbox}); );
-out geom tags;"""
-    overpass(out, q, "pitches and graveyards")
+    bbox = ','.join(map(str, BOUNDS))
+    queries = {
+        'boundary': '[out:json][timeout:120];relation["boundary"="administrative"]["name"="幸区"];out geom;',
+        'map': f'''[out:json][timeout:180];(
+way["highway"]({bbox});way["railway"]({bbox});nwr["natural"~"^(water|wood|tree|tree_row|scrub)$"]({bbox});
+nwr["waterway"]({bbox});nwr["landuse"]({bbox});nwr["leisure"]({bbox});nwr["amenity"]({bbox});
+nwr["tourism"]({bbox});nwr["historic"]({bbox});nwr["shop"="mall"]({bbox});nwr["railway"="station"]({bbox});
+node["highway"="street_lamp"]({bbox}););out geom;''',
+    }
+    for kind, query in queries.items():
+        out = RAW / f'osm_{kind}.json'
+        if out.exists():
+            continue
+        for host in ('https://overpass-api.de/api/interpreter', 'https://overpass.kumi.systems/api/interpreter'):
+            try:
+                download(host, out, urllib.parse.urlencode({'data': query}).encode())
+                doc = json.loads(out.read_text())
+                if doc.get('remark') or not doc.get('elements'):
+                    out.unlink()
+                    raise RuntimeError(f'Overpass incomplete/empty response: {doc.get("remark")}')
+                break
+            except RuntimeError:
+                if host.endswith('kumi.systems/api/interpreter'):
+                    raise
 
 
-def fetch_routes():
-    """Walking routes and the numbered walking-junction network (wandelknooppunten) from OpenStreetMap."""
-    out = RAW / "osm_routes.json"
-    if out.exists():
-        return
-    bbox = osm_bbox()
-    q = f"""[out:json][timeout:120];
-( relation["route"~"^(hiking|foot|walking)$"]({bbox}); node["rwn_ref"]({bbox}); );
-out geom;"""
-    overpass(out, q, "walking routes")
-
-
-def fetch_roads():
-    """The roads, cycle paths, footpaths and farm tracks that people use, from OpenStreetMap, with node ids to find
-    junctions."""
-    out = RAW / "osm_roads.json"
-    if out.exists():
-        return
-    bbox = osm_bbox()
-    kinds = "motorway|motorway_link|trunk|trunk_link|primary|primary_link|secondary|secondary_link|tertiary|tertiary_link|unclassified|residential|living_street|service"
-    q = f"""[out:json][timeout:120];
-( way["highway"~"^({kinds})$"]({bbox}); way["highway"~"^(cycleway|footway|path|pedestrian|track|steps|bridleway)$"]({bbox}); );
-out geom;"""
-    overpass(out, q, "roads and paths for traffic")
+def fetch_gsi():
+    jobs = [('seamlessphoto', 17, x, y, 'jpg') for x, y in tiles(17)]
+    # DEM5A is a bare-earth model. DEM10B fills missing cells, never used as canopy/DSM.
+    jobs += [(layer, z, x, y, 'txt') for layer, z in [('dem5a', 15), ('dem', 14)] for x, y in tiles(z)]
+    def one(job):
+        layer, z, x, y, ext = job
+        download(f'https://cyberjapandata.gsi.go.jp/xyz/{layer}/{z}/{x}/{y}.{ext}',
+                 RAW / 'gsi' / layer / str(z) / str(x) / f'{y}.{ext}', optional=layer == 'dem5a')
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        list(pool.map(one, jobs))
+    print(f'GSI: checked {len(jobs)} bounded cached tiles')
 
 
 def main():
-    RAW.mkdir(parents=True, exist_ok=True)
-    jobs = [fetch_3dbag, fetch_addresses, fetch_osm, fetch_routes, fetch_roads, *(lambda c=c: fetch_bgt(c) for c in BGT_COLLECTIONS)]
-    jobs += [lambda c=c, i=i, j=j: fetch_ahn(c, i, j) for c in ("dsm_05m", "dtm_05m") for i in range(NX) for j in range(NY)]
-    jobs += [lambda i=i, j=j: fetch_aerial(i, j) for i in range(NX) for j in range(NY)]
-    with ThreadPoolExecutor(8) as pool:
-        for fut in [pool.submit(j) for j in jobs]:
-            fut.result()
-    print("done", file=sys.stderr)
+    p = argparse.ArgumentParser(description=__doc__)
+    p.add_argument('--group', choices=['osm', 'gsi', 'metadata', 'all'], default='all')
+    a = p.parse_args()
+    if a.group in ('metadata', 'all'):
+        download('https://www.geospatial.jp/ckan/api/3/action/package_show?id=plateau-14130-kawasaki-shi-2022', RAW / 'plateau/metadata.json')
+    if a.group in ('osm', 'all'):
+        fetch_osm()
+    if a.group in ('gsi', 'all'):
+        fetch_gsi()
+    if a.group == 'all' and not (RAW / 'plateau/kawasaki-2022-v4.zip').exists():
+        raise SystemExit(f'PLATEAU archive missing. Download once to data/raw/plateau/kawasaki-2022-v4.zip from {PLATEAU_URL}')
 
 
-if __name__ == "__main__":
+if __name__ == '__main__':
     main()

@@ -35,9 +35,10 @@ from shapely.ops import unary_union
 
 from config import BUILD, CX, CY, RAW, VIEWS, XMAX, XMIN, YMAX, YMIN
 from geo import screen, wgs_to_rd
+from japan import height
 
-RES = 0.5  # occlusion raster, screen meters per pixel
-STEP = 0.5  # lane sampling for hidden stretches, meters
+RES = 2.0  # occlusion raster, screen meters per pixel
+STEP = 2.0  # lane sampling for hidden stretches, meters
 
 # Road class: default speed (km/h); for cars the weight at junctions (they prefer the bigger road) and cars per km of
 # lane; the same two for cyclists, who prefer cycle paths and quiet roads, and for walkers, who prefer footpaths,
@@ -67,10 +68,10 @@ def local(lat, lon):
 
 
 def road_ways():
-    for w in json.loads((RAW / "osm_roads.json").read_text())["elements"]:
+    for w in json.loads((RAW / "osm_map.json").read_text())["elements"]:
         t = w.get("tags", {})
         hw = t.get("highway", "")
-        if w["type"] != "way" or t.get("area") == "yes" or t.get("service") in SKIP_SERVICE:
+        if t.get("tunnel") == "yes" or t.get("bridge") == "yes" or w["type"] != "way" or t.get("area") == "yes" or t.get("service") in SKIP_SERVICE:
             continue
         if hw == "cycleway" or (hw in ("path", "track", "footway", "bridleway") and t.get("bicycle") in ("designated", "yes")):
             base = "cycleway"
@@ -156,17 +157,7 @@ def clip(edges):
 
 
 def surfaces():
-    """The BGT carriageways and cycle paths in local meters, to measure where each road lies and how wide it is."""
-    groups = {"road": [], "cycle": [], "foot": []}
-    for f in json.loads((RAW / "bgt_wegdeel.geojson").read_text())["features"]:
-        fn = f["properties"].get("functie") or ""
-        key = "road" if fn.startswith("rijbaan") else "cycle" if fn == "fietspad" else "foot" if fn == "voetpad" else None
-        if key and f["geometry"]:
-            groups[key].append(affinity.affine_transform(shape(f["geometry"]), [1, 0, 0, -1, -CX, CY]).buffer(0))
-    out = {k: unary_union(v) for k, v in groups.items()}
-    for g in out.values():
-        prepare(g)
-    return out
+    return {"road":None,"cycle":None,"foot":None}
 
 
 def measure(pts, surface, foot):
@@ -247,7 +238,7 @@ def lanes(edges):
         elif not e["oneway"]:
             dirs.append((e["pts"][::-1], e["b"], e["a"], -1))
         kind = {"motorway": None, "cycleway": "cycle", "footway": None, "track": None}.get(e["c"], "road")
-        fit = kind and measure(e["pts"], surface[kind], surface["foot"])
+        fit = None
         measured += bool(fit)
         for pts, a, b, sign in dirs:
             if e["c"] == "motorway":
@@ -271,12 +262,13 @@ def lanes(edges):
                 off = 0.0 if e["oneway"] else width
                 bike = off if e["c"] in ("cycleway", "track") else off + 0.75
                 walk = off if e["c"] in ("footway", "track") else bike + 0.25
+            off, bike, walk = -off, -bike, -walk
             p = offset(pts, off)
             if len(p) >= 2:
                 lane = {"e": i, "a": a, "b": b, "p": p, **{k: e[k] for k in ("c", "v", "w", "d", "wb", "db", "ww", "dw")}}
                 lane["bo"], lane["wo"] = round(bike - off, 2), round(walk - off, 2)
                 out.append(lane)
-    lanes.measured = f"{measured} of {len(edges)} stretches of road measured on the BGT"
+    lanes.measured = f"{measured} of {len(edges)} stretches of road using class-estimated OSM widths (left-hand traffic)"
     return out
 
 
@@ -300,7 +292,9 @@ def occluders(bounds, look):
     buildings = np.array(img, dtype=bool)
     draw = ImageDraw.Draw(trees)
     t = np.fromfile(BUILD / "trees.bin", dtype=np.float32).reshape(-1, 10)
-    for x, z, ht, r, base, kind in t[:, :6]:
+    for x, z, ht, r, base, kind, ground in t[:, :7]:
+        ht += ground
+        base += ground
         if kind > 0.5:  # conifer: a cone from half the crown base up to the top
             bottom, rr = base * 0.5, r * 0.9
             cu, cv = screen(x, z, bottom, look)
@@ -346,7 +340,7 @@ def hidden(lanes_):
     for ln in lanes_:
         ln["h"], ln["t"] = [], []
     for look in VIEWS:
-        uv = [screen(xs, zs, 0, look) for _, xs, zs in samples]
+        uv = [screen(xs, zs, height(xs+CX,CY-zs), look) for _, xs, zs in samples]
         us, vs = np.concatenate([u for u, _ in uv]), np.concatenate([v for _, v in uv])
         bounds = (us.min() - 2, vs.min() - 2, us.max() + 2, vs.max() + 2)
         buildings, trees = occluders(bounds, look)
